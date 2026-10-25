@@ -4,6 +4,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** logcat tag for every capture start/stop/reject line; host tooling greps for it. */
+const val CAPTURE_LOG_TAG = "TunPcap"
+
 sealed interface CaptureCommand {
     data class Start(val packages: List<String>, val pcapName: String) : CaptureCommand
     object Stop : CaptureCommand

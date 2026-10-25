@@ -65,4 +65,26 @@ class ServiceStore(context: Context) {
         key = "dynamic_notification",
         defaultValue = true
     )
+
+    // Capture session handed from CaptureCtrl (app process) to TunService (:background).
+    var captureActive by store.boolean(
+        key = "capture_active",
+        defaultValue = false
+    )
+
+    var capturePackages by store.stringSet(
+        key = "capture_packages",
+        defaultValue = emptySet()
+    )
+
+    var capturePcapName by store.string(
+        key = "capture_pcap_name",
+        defaultValue = ""
+    )
+
+    fun clearCapture() {
+        captureActive = false
+        capturePackages = emptySet()
+        capturePcapName = ""
+    }
 }

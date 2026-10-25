@@ -6,9 +6,15 @@ import android.content.Intent
 import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.ParcelFileDescriptor
+import com.github.kr328.clash.common.capture.CAPTURE_LOG_TAG
 import com.github.kr328.clash.common.compat.pendingIntentFlags
 import com.github.kr328.clash.common.constants.Components
 import com.github.kr328.clash.common.log.Log
+import com.github.kr328.clash.core.Clash
+import com.github.kr328.clash.core.model.ConfigurationOverride
+import com.github.kr328.clash.core.model.TunnelState
+import com.github.kr328.clash.service.capture.PcapOutput
 import com.github.kr328.clash.service.clash.clashRuntime
 import com.github.kr328.clash.service.clash.module.*
 import com.github.kr328.clash.service.model.AccessControlMode
@@ -28,6 +34,17 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
 
     private val runtime = clashRuntime {
         val store = ServiceStore(self)
+
+        // Capture: global mode via the session override, which the runtime clears
+        // on start and on exit, so the user's own mode comes back after stop.
+        // Must be patched before ConfigurationModule loads the profile.
+        val egress = if (store.captureActive) {
+            Clash.patchOverride(
+                Clash.OverrideSlot.Session,
+                ConfigurationOverride(mode = TunnelState.Mode.Global)
+            )
+            install(CaptureEgressModule(self))
+        } else null
 
         val close = install(CloseModule(self))
         val tun = install(TunModule(self))
@@ -52,6 +69,11 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
                         true
                     }
                     config.onEvent {
+                        reason = it.message
+
+                        true
+                    }
+                    egress?.onEvent {
                         reason = it.message
 
                         true
@@ -101,7 +123,16 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
     }
 
     override fun onDestroy() {
+        // Also the path for VpnService.onRevoke (its default calls stopSelf):
+        // stopping the tun finalizes the pcap before the capture flag is cleared.
         TunModule.requestStop()
+
+        ServiceStore(this).let { store ->
+            if (store.captureActive) {
+                store.clearCapture()
+                android.util.Log.i(CAPTURE_LOG_TAG, "stopped: ${reason ?: "requested"}")
+            }
+        }
 
         StatusProvider.serviceRunning = false
 
@@ -122,6 +153,9 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
 
     private fun TunModule.open() {
         val store = ServiceStore(self)
+
+        if (store.captureActive)
+            return openCapture(store)
 
         val device = with(Builder()) {
             // Interface address
@@ -228,7 +262,74 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
         attach(device)
     }
 
+    // Capture mode ignores the user's network settings on purpose: anything that
+    // lets the captured apps' traffic skip the TUN (system HTTP proxy, allowBypass,
+    // bypassed private routes) would leave holes in the pcap and change the egress.
+    // No IPv6 address or route: Android then blocks IPv6 for these apps, so they
+    // fall back to IPv4 instead of leaking around the VPN.
+    private fun TunModule.openCapture(store: ServiceStore) {
+        val packages = store.capturePackages
+        val name = store.capturePcapName
+
+        try {
+            val vpnFd = with(Builder()) {
+                addAddress(TUN_GATEWAY, TUN_SUBNET_PREFIX)
+                addRoute(NET_ANY, 0)
+                packages.forEach { addAllowedApplication(it) }
+                setBlocking(false)
+                setMtu(TUN_MTU)
+                setSession(CAPTURE_SESSION)
+                addDnsServer(TUN_DNS)
+                setConfigureIntent(
+                    PendingIntent.getActivity(
+                        self,
+                        R.id.nf_vpn_status,
+                        Intent().setComponent(Components.MAIN_ACTIVITY),
+                        pendingIntentFlags(PendingIntent.FLAG_UPDATE_CURRENT)
+                    )
+                )
+                if (Build.VERSION.SDK_INT >= 29) {
+                    setMetered(false)
+                }
+
+                establish()?.detachFd() ?: throw NullPointerException("Establish VPN rejected by system")
+            }
+
+            val pcapFd = try {
+                PcapOutput.create(name).detachFd()
+            } catch (e: Exception) {
+                ParcelFileDescriptor.adoptFd(vpnFd).close()
+                throw e
+            }
+
+            attach(
+                TunModule.TunDevice(
+                    fd = vpnFd,
+                    stack = CAPTURE_STACK,
+                    gateway = "$TUN_GATEWAY/$TUN_SUBNET_PREFIX",
+                    portal = TUN_PORTAL,
+                    dns = if (store.dnsHijacking) NET_ANY else TUN_DNS,
+                    pcapFd = pcapFd,
+                )
+            )
+        } catch (e: Exception) {
+            android.util.Log.e(CAPTURE_LOG_TAG, "rejected: ${e.message}")
+            throw e
+        }
+
+        android.util.Log.i(
+            CAPTURE_LOG_TAG,
+            "started file=${PcapOutput.file(name)} apps=${packages.joinToString(",")}"
+        )
+    }
+
     companion object {
+        private const val CAPTURE_SESSION = "TunPcap"
+
+        // mips never writes rewritten app packets back to the TUN, so the relay
+        // in the core sees exactly what the captured apps sent and received.
+        private const val CAPTURE_STACK = "mips"
+
         private const val TUN_MTU = 9000
         private const val TUN_SUBNET_PREFIX = 30
         private const val TUN_GATEWAY = "172.19.0.1"
