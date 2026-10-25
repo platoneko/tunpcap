@@ -71,6 +71,20 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- No noHistory: the activity must survive the VPN consent dialog to get its result. -->
+        <activity
+            android:name=".CaptureCtrlActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen" />
+
+        <!-- `am start -n <pkg>/.CaptureCtrl` resolves to <pkg>.CaptureCtrl; only adb shell holds DUMP. -->
+        <activity-alias
+            android:name="${applicationId}.CaptureCtrl"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:targetActivity=".CaptureCtrlActivity" />
+
         <activity
             android:name=".ExternalControlActivity"
             android:excludeFromRecents="true"
