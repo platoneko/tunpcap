@@ -5,7 +5,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
+
+	"cfa/native/tunpcap"
 
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -14,7 +17,62 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-func Start(fd int, stack, gateway, portal, dns string) (io.Closer, error) {
+// Start runs the netstack on the VPN fd. pcapFd < 0 keeps upstream behavior;
+// otherwise a relay between the VPN fd and the netstack tees every packet
+// into a pcap written to pcapFd (see package tunpcap).
+func Start(fd int, stack, gateway, portal, dns string, pcapFd int) (io.Closer, error) {
+	if pcapFd < 0 {
+		return startStack(fd, stack, gateway, portal, dns)
+	}
+
+	pcapFile := os.NewFile(uintptr(pcapFd), "pcap")
+	writer, err := tunpcap.NewWriter(pcapFile, pcapQueueLen)
+	if err != nil {
+		_ = pcapFile.Close()
+		log.Errorln("TunPcap: open pcap: %s", err)
+		return nil, err
+	}
+	innerFd, relay, err := tunpcap.StartRelay(fd, writer)
+	if err != nil {
+		_, _, _ = writer.Close()
+		log.Errorln("TunPcap: start relay: %s", err)
+		return nil, err
+	}
+	listener, err := startStack(innerFd, stack, gateway, portal, dns)
+	if err != nil {
+		_ = relay.Close()
+		_, _, _ = writer.Close()
+		return nil, err
+	}
+	log.Infoln("TunPcap: capturing to fd %d", pcapFd)
+	return &captureCloser{listener: listener, relay: relay, writer: writer}, nil
+}
+
+const pcapQueueLen = 4096
+
+type captureCloser struct {
+	listener io.Closer
+	relay    io.Closer
+	writer   *tunpcap.Writer
+}
+
+// Close stops the netstack first, then the relay, and only then finalizes the
+// pcap so that every forwarded packet is on disk before the VPN goes away.
+func (c *captureCloser) Close() error {
+	err := c.listener.Close()
+	_ = c.relay.Close()
+	written, dropped, werr := c.writer.Close()
+	if werr != nil {
+		log.Errorln("TunPcap: finalize pcap: %s", werr)
+	}
+	log.Infoln("TunPcap: stopped written=%d dropped=%d", written, dropped)
+	if err != nil {
+		return err
+	}
+	return werr
+}
+
+func startStack(fd int, stack, gateway, portal, dns string) (io.Closer, error) {
 	log.Debugln("TUN: fd = %d, stack = %s, gateway = %s, portal = %s, dns = %s", fd, stack, gateway, portal, dns)
 
 	tunStack, ok := C.StackTypeMapping[strings.ToLower(stack)]
