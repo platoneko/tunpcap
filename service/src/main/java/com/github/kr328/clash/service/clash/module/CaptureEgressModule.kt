@@ -6,6 +6,7 @@ import com.github.kr328.clash.common.capture.CAPTURE_LOG_TAG
 import com.github.kr328.clash.common.constants.Intents
 import com.github.kr328.clash.core.Clash
 import com.github.kr328.clash.core.model.ProxySort
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 
 /**
@@ -14,6 +15,9 @@ import kotlinx.coroutines.channels.Channel
  */
 class CaptureEgressModule(service: Service) : Module<CaptureEgressModule.Rejected>(service) {
     data class Rejected(val message: String)
+
+    /** Completes once a loaded profile passed the check; TunService opens the VPN only then. */
+    val ready = CompletableDeferred<Unit>()
 
     // Registered at construction, i.e. before ConfigurationModule exists, so the
     // first PROFILE_LOADED broadcast cannot be missed.
@@ -34,6 +38,7 @@ class CaptureEgressModule(service: Service) : Module<CaptureEgressModule.Rejecte
             }
 
             Log.i(CAPTURE_LOG_TAG, "egress GLOBAL=$now mode=${Clash.queryTunnelState().mode}")
+            ready.complete(Unit)
         }
     }
 

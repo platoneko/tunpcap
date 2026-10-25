@@ -8,6 +8,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.github.kr328.clash.common.capture.CAPTURE_LOG_TAG
+import com.github.kr328.clash.common.capture.CaptureSession
 import com.github.kr328.clash.common.compat.pendingIntentFlags
 import com.github.kr328.clash.common.constants.Components
 import com.github.kr328.clash.common.log.Log
@@ -32,13 +33,21 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
 
     private var reason: String? = null
 
+    // Set once the capture's .part file exists; onDestroy publishes it after the flush.
+    @Volatile
+    private var capturePcapName: String? = null
+
     private val runtime = clashRuntime {
         val store = ServiceStore(self)
+
+        // Only an explicit CaptureCtrl request makes this start a capture; any
+        // other start also clears leftovers of a killed capture.
+        val capture = store.capture.take()
 
         // Capture: global mode via the session override, which the runtime clears
         // on start and on exit, so the user's own mode comes back after stop.
         // Must be patched before ConfigurationModule loads the profile.
-        val egress = if (store.captureActive) {
+        val egress = if (capture != null) {
             Clash.patchOverride(
                 Clash.OverrideSlot.Session,
                 ConfigurationOverride(mode = TunnelState.Mode.Global)
@@ -61,7 +70,29 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
         install(SuspendModule(self))
 
         try {
-            tun.open()
+            // Capture: no VPN until the profile is loaded and GLOBAL verified. Until
+            // then the core runs an empty rule-mode config that sends everything
+            // DIRECT, which would leak the captured apps' first connections.
+            if (egress != null) {
+                val proceed = select<Boolean> {
+                    close.onEvent { false }
+                    config.onEvent {
+                        reason = it.message
+
+                        false
+                    }
+                    egress.onEvent {
+                        reason = it.message
+
+                        false
+                    }
+                    egress.ready.onAwait { true }
+                }
+
+                if (!proceed) return@clashRuntime
+            }
+
+            tun.open(capture)
 
             while (isActive) {
                 val quit = select<Boolean> {
@@ -124,14 +155,19 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
 
     override fun onDestroy() {
         // Also the path for VpnService.onRevoke (its default calls stopSelf):
-        // stopping the tun finalizes the pcap before the capture flag is cleared.
+        // stopping the tun flushes and closes the pcap, only then is it published.
         TunModule.requestStop()
 
-        ServiceStore(this).let { store ->
-            if (store.captureActive) {
-                store.clearCapture()
-                android.util.Log.i(CAPTURE_LOG_TAG, "stopped: ${reason ?: "requested"}")
+        capturePcapName?.let { name ->
+            try {
+                PcapOutput.files.finish(name)
+                android.util.Log.i(CAPTURE_LOG_TAG, "stopped file=${PcapOutput.files.final(name)}: ${reason ?: "requested"}")
+            } catch (e: Exception) {
+                android.util.Log.e(CAPTURE_LOG_TAG, "stopped, but ${e.message}")
             }
+        }
+        ServiceStore(this).capture.let { capture ->
+            if (capture.active) capture.clear()
         }
 
         StatusProvider.serviceRunning = false
@@ -151,11 +187,11 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
         runtime.requestGc()
     }
 
-    private fun TunModule.open() {
+    private fun TunModule.open(capture: CaptureSession?) {
         val store = ServiceStore(self)
 
-        if (store.captureActive)
-            return openCapture(store)
+        if (capture != null)
+            return openCapture(capture, store)
 
         val device = with(Builder()) {
             // Interface address
@@ -267,11 +303,14 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
     // bypassed private routes) would leave holes in the pcap and change the egress.
     // No IPv6 address or route: Android then blocks IPv6 for these apps, so they
     // fall back to IPv4 instead of leaking around the VPN.
-    private fun TunModule.openCapture(store: ServiceStore) {
-        val packages = store.capturePackages
-        val name = store.capturePcapName
+    private fun TunModule.openCapture(capture: CaptureSession, store: ServiceStore) {
+        val packages = capture.packages
+        val name = capture.pcapName
 
         try {
+            // Without any allowed app Android would route the whole device into the VPN.
+            require(packages.isNotEmpty()) { "no apps to capture" }
+
             val vpnFd = with(Builder()) {
                 addAddress(TUN_GATEWAY, TUN_SUBNET_PREFIX)
                 addRoute(NET_ANY, 0)
@@ -296,11 +335,12 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
             }
 
             val pcapFd = try {
-                PcapOutput.create(name).detachFd()
+                PcapOutput.open(name).detachFd()
             } catch (e: Exception) {
                 ParcelFileDescriptor.adoptFd(vpnFd).close()
                 throw e
             }
+            capturePcapName = name
 
             attach(
                 TunModule.TunDevice(
@@ -319,7 +359,7 @@ class TunService : VpnService(), CoroutineScope by CoroutineScope(Dispatchers.De
 
         android.util.Log.i(
             CAPTURE_LOG_TAG,
-            "started file=${PcapOutput.file(name)} apps=${packages.joinToString(",")}"
+            "started file=${PcapOutput.files.final(name)} apps=${packages.joinToString(",")}"
         )
     }
 

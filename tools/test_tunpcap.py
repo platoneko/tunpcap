@@ -38,15 +38,33 @@ class BuildArgsTest(unittest.TestCase):
         )
 
 
-class VpnActiveTest(unittest.TestCase):
-    def test_vpn_active_matches_session(self):
-        text = "NetworkAgentInfo{... VpnTransportInfo{type=1, sessionId=TunPcap, bypassable=false} ...}"
-        self.assertTrue(tunpcap.vpn_active(text))
+class CaptureOutcomeTest(unittest.TestCase):
+    START_REQ = "10-25 13:04:05.100  1234  1234 I TunPcap : start requested"
+    EGRESS = "10-25 13:04:06.200  2345  2399 I TunPcap : egress GLOBAL=BR-01 mode=Global"
+    STARTED = ("10-25 13:04:06.300  2345  2399 I TunPcap : "
+               "started file=/storage/emulated/0/Download/TunPcap/t1.pcap apps=com.android.chrome")
 
-    def test_vpn_active_ignores_other_vpn(self):
-        self.assertFalse(tunpcap.vpn_active("VpnTransportInfo{type=1, sessionId=PCAPdroid}"))
-        self.assertFalse(tunpcap.vpn_active("VpnTransportInfo{type=1, sessionId=Clash}"))
-        self.assertFalse(tunpcap.vpn_active(""))
+    def test_capture_outcome_started(self):
+        log = "\n".join([self.START_REQ, self.EGRESS, self.STARTED])
+        self.assertEqual(
+            tunpcap.capture_outcome(log),
+            ("started", "started file=/storage/emulated/0/Download/TunPcap/t1.pcap apps=com.android.chrome"),
+        )
+
+    def test_capture_outcome_rejected(self):
+        log = "\n".join([
+            self.START_REQ,
+            "10-25 13:04:06.200  2345  2399 E TunPcap : rejected: GLOBAL selects DIRECT",
+        ])
+        self.assertEqual(tunpcap.capture_outcome(log), ("rejected", "rejected: GLOBAL selects DIRECT"))
+
+    def test_capture_outcome_pending(self):
+        self.assertIsNone(tunpcap.capture_outcome("\n".join([self.START_REQ, self.EGRESS])))
+        self.assertIsNone(tunpcap.capture_outcome(""))
+
+    def test_capture_outcome_ignores_other_tags(self):
+        log = "10-25 13:04:06.300  2345  2399 I Other   : started file=/x apps=y"
+        self.assertIsNone(tunpcap.capture_outcome(log))
 
 
 class PcapHeaderTest(unittest.TestCase):

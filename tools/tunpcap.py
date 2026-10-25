@@ -21,12 +21,13 @@ from pathlib import Path
 PKG = "dev.plat1ko.tunpcap"
 CTRL = f"{PKG}/.CaptureCtrl"
 PHONE_DIR = "/sdcard/Download/TunPcap"
-VPN_SESSION = "sessionid=tunpcap"
+LOG_TAG = "TunPcap"
 
 PCAP_MAGIC = 0xA1B2C3D4
 LINKTYPE_RAW = 101
 
-VPN_WAIT_SECONDS = 10
+OUTCOME_WAIT_SECONDS = 15
+PULL_WAIT_SECONDS = 30
 POLL_SECONDS = 0.5
 
 
@@ -47,9 +48,22 @@ def build_stop_args() -> list[str]:
     return ["am", "start", "-n", CTRL, "--es", "action", "stop"]
 
 
-def vpn_active(dumpsys_connectivity: str) -> bool:
-    """Same signal the PCAPdroid capture script uses: the VPN session name."""
-    return VPN_SESSION in dumpsys_connectivity.lower()
+def capture_outcome(logcat: str) -> tuple[str, str] | None:
+    """First decisive TunPcap log line: ("started"|"rejected", message), or None yet.
+
+    The app logs "started" only after the profile is loaded, GLOBAL is verified and
+    the VPN is up, so traffic of the captured apps already leaves via the proxy.
+    """
+    for line in logcat.splitlines():
+        head, sep, message = line.partition(": ")
+        if not sep or not head.rstrip().endswith(f" {LOG_TAG}"):
+            continue
+        message = message.strip()
+        if message.startswith("started "):
+            return "started", message
+        if message.startswith("rejected:"):
+            return "rejected", message
+    return None
 
 
 def check_pcap_header(head: bytes) -> int:
@@ -77,23 +91,22 @@ def adb_shell(serial: str, args: list[str]) -> str:
     return adb(serial, "shell", " ".join(shlex.quote(a) for a in args))
 
 
-def is_vpn_up(serial: str) -> bool:
-    return vpn_active(adb(serial, "shell", "dumpsys connectivity"))
+def device_now(serial: str) -> str:
+    """Phone clock in logcat's -T format, so we only read lines from this run."""
+    return adb(serial, "shell", "date '+%m-%d %H:%M:%S.000'").strip()
 
 
-def wait_vpn(serial: str, seconds: float) -> bool:
+def app_log_since(serial: str, since: str) -> str:
+    return adb(serial, "logcat", "-d", "-T", since, "-s", LOG_TAG)
+
+
+def wait_outcome(serial: str, since: str, seconds: float) -> tuple[str, str] | None:
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if is_vpn_up(serial):
-            return True
+    while True:
+        outcome = capture_outcome(app_log_since(serial, since))
+        if outcome or time.monotonic() >= deadline:
+            return outcome
         time.sleep(POLL_SECONDS)
-    return is_vpn_up(serial)
-
-
-def recent_app_log(serial: str, lines: int = 20) -> str:
-    log = adb(serial, "logcat", "-d")
-    hits = [line for line in log.splitlines() if "TunPcap" in line]
-    return "\n".join(hits[-lines:])
 
 
 def remote_size(serial: str, path: str) -> int:
@@ -105,16 +118,20 @@ def remote_size(serial: str, path: str) -> int:
 
 def cmd_start(args: argparse.Namespace) -> int:
     apps = [a.strip() for a in args.app.split(",") if a.strip()]
+    since = device_now(args.serial)
     adb_shell(args.serial, build_start_args(apps, args.name))
 
-    if not wait_vpn(args.serial, VPN_WAIT_SECONDS):
+    outcome = wait_outcome(args.serial, since, OUTCOME_WAIT_SECONDS)
+    if outcome is None:
         # Normal path whenever another app took the VPN since the last capture.
         input("请在手机上点 VPN 授权（确定），点完按回车 >>> ")
-        if not wait_vpn(args.serial, VPN_WAIT_SECONDS):
-            print("VPN 没有起来。TunPcap 日志：", file=sys.stderr)
-            print(recent_app_log(args.serial), file=sys.stderr)
-            return 1
-    print(f"capturing {','.join(apps)} → {PHONE_DIR}/{args.name or '<default name, see logcat>'}")
+        outcome = wait_outcome(args.serial, since, OUTCOME_WAIT_SECONDS)
+
+    if outcome is None or outcome[0] != "started":
+        print("抓包没有开始。TunPcap 日志：", file=sys.stderr)
+        print(app_log_since(args.serial, since), file=sys.stderr)
+        return 1
+    print(outcome[1])
     return 0
 
 
@@ -126,17 +143,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 def cmd_pull(args: argparse.Namespace) -> int:
     remote = f"{PHONE_DIR}/{args.name}"
-    # The app flushes on stop; wait until the size settles before pulling.
-    last = -1
-    for _ in range(60):
-        size = remote_size(args.serial, remote)
-        if size >= 24 and size == last:
-            break
-        last = size
+    # The app writes <name>.part and renames it only after the pcap is flushed on
+    # stop, so the final name existing means the file is complete.
+    deadline = time.monotonic() + PULL_WAIT_SECONDS
+    while remote_size(args.serial, remote) < 24:
+        if time.monotonic() >= deadline:
+            print(f"{remote} 还没出现：抓包是否已 stop？（未完成的文件叫 {args.name}.part）", file=sys.stderr)
+            return 1
         time.sleep(POLL_SECONDS)
-    else:
-        print(f"{remote} 不存在或一直在变大 (size={last})", file=sys.stderr)
-        return 1
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

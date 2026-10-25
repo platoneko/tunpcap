@@ -26,7 +26,11 @@ adb -s <SERIAL> shell am start -n dev.plat1ko.tunpcap/.CaptureCtrl \
 adb -s <SERIAL> shell am start -n dev.plat1ko.tunpcap/.CaptureCtrl --es action stop
 ```
 
-pcap 存在手机 `/sdcard/Download/TunPcap/<文件名>`。同名文件已存在时拒绝开始，不会覆盖。
+pcap 存在手机 `/sdcard/Download/TunPcap/<文件名>`。同名文件（包括未完成的 `<文件名>.part`）已存在时拒绝开始，不会覆盖。
+
+- **什么时候算开始**：App 先等配置加载完、确认 `GLOBAL` 选的是代理节点，才建 VPN，然后在 logcat 写 `started file=...`。脚本 `start` 以这一行（或 `rejected: ...`）为准，所以它报告开始时，被抓 App 的流量已经从节点出去了，不会有直连窗口。
+- **什么时候算完成**：抓包期间写的是 `<文件名>.part`，`stop` 后数据全部落盘才改名为正式文件名。脚本 `pull` 等正式文件名出现才拉。进程被杀时会留下 `.part`，那是不完整的文件。
+- **授权弹窗还开着时发 `stop`**：会取消这次开始，之后再点「确定」也不会启动。
 
 ## 使用前
 

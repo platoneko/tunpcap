@@ -1,6 +1,7 @@
 package com.github.kr328.clash.service.store
 
 import android.content.Context
+import com.github.kr328.clash.common.capture.CaptureState
 import com.github.kr328.clash.common.store.Store
 import com.github.kr328.clash.common.store.asStoreProvider
 import com.github.kr328.clash.service.PreferenceProvider
@@ -8,11 +9,10 @@ import com.github.kr328.clash.service.model.AccessControlMode
 import java.util.*
 
 class ServiceStore(context: Context) {
-    private val store = Store(
-        PreferenceProvider
-            .createSharedPreferencesFromContext(context)
-            .asStoreProvider()
-    )
+    private val provider = PreferenceProvider
+        .createSharedPreferencesFromContext(context)
+        .asStoreProvider()
+    private val store = Store(provider)
 
     var activeProfile: UUID? by store.typedString(
         key = "active_profile",
@@ -67,24 +67,5 @@ class ServiceStore(context: Context) {
     )
 
     // Capture session handed from CaptureCtrl (app process) to TunService (:background).
-    var captureActive by store.boolean(
-        key = "capture_active",
-        defaultValue = false
-    )
-
-    var capturePackages by store.stringSet(
-        key = "capture_packages",
-        defaultValue = emptySet()
-    )
-
-    var capturePcapName by store.string(
-        key = "capture_pcap_name",
-        defaultValue = ""
-    )
-
-    fun clearCapture() {
-        captureActive = false
-        capturePackages = emptySet()
-        capturePcapName = ""
-    }
+    val capture = CaptureState(provider)
 }

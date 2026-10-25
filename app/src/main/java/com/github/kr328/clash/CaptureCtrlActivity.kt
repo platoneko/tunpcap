@@ -10,6 +10,7 @@ import com.github.kr328.clash.common.capture.CAPTURE_LOG_TAG
 import com.github.kr328.clash.common.capture.CaptureCommand
 import com.github.kr328.clash.common.capture.CaptureRequest
 import com.github.kr328.clash.common.capture.CaptureRequestException
+import com.github.kr328.clash.common.capture.CaptureSession
 import com.github.kr328.clash.common.compat.startForegroundServiceCompat
 import com.github.kr328.clash.common.util.intent
 import com.github.kr328.clash.remote.StatusClient
@@ -56,33 +57,37 @@ class CaptureCtrlActivity : Activity(), CoroutineScope by MainScope() {
     }
 
     private fun stop() {
-        if (ServiceStore(this).captureActive) {
-            stopClashService()
-            Log.i(CAPTURE_LOG_TAG, "stop requested")
-        } else {
-            Log.i(CAPTURE_LOG_TAG, "stop: not capturing")
+        val capture = ServiceStore(this).capture
+        val running = isClashRunning()
+        when {
+            // Consent dialog still up: nothing runs yet, so cancel the request instead.
+            !running && capture.pending() != null -> {
+                capture.clear()
+                Log.i(CAPTURE_LOG_TAG, "stop: cancelled pending start")
+            }
+            running && capture.active -> {
+                stopClashService()
+                Log.i(CAPTURE_LOG_TAG, "stop requested")
+            }
+            else -> Log.i(CAPTURE_LOG_TAG, "stop: not capturing")
         }
     }
 
     /** Returns true when waiting for the VPN consent result. */
     private suspend fun start(command: CaptureCommand.Start): Boolean {
-        val store = ServiceStore(this)
+        val capture = ServiceStore(this).capture
 
         command.packages.firstOrNull { !isInstalled(it) }?.let {
             return reject("package not installed: $it")
         }
 
+        // A stale active flag from a killed process is fine: TunService clears it.
         val running = isClashRunning()
-        if (store.captureActive) {
-            if (running)
-                return reject("already capturing")
-            // Left over by a killed process; TunService never got to clear it.
-            store.clearCapture()
-        }
+        if (running && capture.active)
+            return reject("already capturing")
 
-        val file = PcapOutput.file(command.pcapName)
-        if (file.exists())
-            return reject("file exists: $file")
+        if (PcapOutput.files.exists(command.pcapName))
+            return reject("file exists: ${PcapOutput.files.final(command.pcapName)}")
 
         if (running) {
             stopClashService()
@@ -90,9 +95,7 @@ class CaptureCtrlActivity : Activity(), CoroutineScope by MainScope() {
                 return reject("could not stop running proxy")
         }
 
-        store.captureActive = true
-        store.capturePackages = command.packages.toSet()
-        store.capturePcapName = command.pcapName
+        capture.request(CaptureSession(command.packages.toSet(), command.pcapName))
 
         val consent = VpnService.prepare(this)
         if (consent != null) {
@@ -112,11 +115,15 @@ class CaptureCtrlActivity : Activity(), CoroutineScope by MainScope() {
         if (requestCode != REQUEST_VPN_CONSENT)
             return
 
-        if (resultCode == RESULT_OK) {
-            launchCapture()
-        } else {
-            ServiceStore(this).clearCapture()
-            Log.e(CAPTURE_LOG_TAG, "rejected: vpn consent denied")
+        val capture = ServiceStore(this).capture
+        when {
+            resultCode != RESULT_OK -> {
+                capture.clear()
+                Log.e(CAPTURE_LOG_TAG, "rejected: vpn consent denied")
+            }
+            // `stop` arrived while the dialog was up and cancelled the request.
+            capture.pending() == null -> Log.i(CAPTURE_LOG_TAG, "start cancelled before consent")
+            else -> launchCapture()
         }
         finish()
     }
